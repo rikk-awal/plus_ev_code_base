@@ -1,0 +1,554 @@
+import pandas as pd
+import numpy as np
+
+class MarketAnalyzer:
+    def __init__(self, timeframe):
+        self.timeframe = timeframe
+
+    def resample_data(self, data):
+        data = data.copy()
+        data['datetime'] = pd.to_datetime(data.iloc[:, 0])
+        data.set_index('datetime', inplace=True)
+        resampled = data.resample(self.timeframe).agg({
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last',
+            'volume': 'sum'
+        }).dropna()
+        return resampled
+
+    def calculate_indicators(self, data):
+        if len(data) < 200:
+            raise ValueError(f"Insufficient data points after resampling. Need at least 200, but got {len(data)}.")
+
+        close = data['close']
+        high = data['high']
+        low = data['low']
+        volume = data['volume']
+
+        ma20 = close.rolling(window=20).mean()
+        ma200 = close.rolling(window=200).mean()
+
+        atr = self.calculate_atr(high, low, close)
+
+        highest_high = high.rolling(window=100).max()
+        lowest_low = low.rolling(window=100).min()
+        
+        premium_zone = highest_high - atr
+        discount_zone = lowest_low + atr
+        equilibrium = (premium_zone + discount_zone) / 2
+
+        return {
+            'ma20': ma20,
+            'ma200': ma200,
+            'atr': atr,
+            'premium_zone': premium_zone,
+            'discount_zone': discount_zone,
+            'equilibrium': equilibrium,
+            'volume': volume
+        }
+
+    def calculate_atr(self, high, low, close, period=14):
+        tr = np.maximum(high - low, 
+                       np.abs(high - close.shift(1)),
+                       np.abs(low - close.shift(1)))
+        return tr.rolling(window=period).mean()
+
+    def calculate_volume_profile(self, data, indicators, lookback=200):
+        if len(data) < lookback:
+            raise ValueError(f"Insufficient data points for volume profile. Need at least {lookback}, but got {len(data)}.")
+            
+        recent_data = data.iloc[-lookback:]
+        price_range = recent_data['high'].max() - recent_data['low'].min()
+        num_rows = 25
+        
+        bins = np.linspace(recent_data['low'].min(), recent_data['high'].max(), num_rows + 1)
+        volume_profile, _ = np.histogram(recent_data['close'], 
+                                       bins=bins, 
+                                       weights=recent_data['volume'])
+        return volume_profile
+
+    def detect_fair_value_gaps(self, data):
+        bullish_fvg = (data['low'] > data['high'].shift(2)) & (data['close'].shift(1) > data['open'].shift(1))
+        bearish_fvg = (data['high'] < data['low'].shift(2)) & (data['close'].shift(1) < data['open'].shift(1))
+        return bullish_fvg, bearish_fvg
+
+    def detect_order_blocks(self, data, block_size=10, block_threshold=0.05):
+        heights = np.abs(data['high'] - data['low'])
+        height_sum = heights.rolling(window=block_size).sum()
+        block_height = height_sum / block_size
+        block_thresholds = block_threshold * block_height
+
+        order_blocks = pd.Series(False, index=data.index)
+        for i in range(block_size, len(data)):
+            if (data['high'].iloc[i-1] < data['high'].iloc[i] and 
+                data['low'].iloc[i-1] < data['low'].iloc[i] and
+                heights.iloc[i] < block_thresholds.iloc[i]):
+                order_blocks.iloc[i] = True
+        return order_blocks
+
+    def identify_market_state(self, data, indicators):
+        if len(data) < 200:
+            return 'Insufficient Data', {}
+
+        current_price = data['close'].iloc[-1]
+        ma20 = indicators['ma20'].iloc[-1]
+        ma200 = indicators['ma200'].iloc[-1]
+        premium_zone = indicators['premium_zone'].iloc[-1]
+        discount_zone = indicators['discount_zone'].iloc[-1]
+        equilibrium = indicators['equilibrium'].iloc[-1]
+
+        ma_diff = (ma20 - ma200) / ma200
+        
+        volume_profile = self.calculate_volume_profile(data, indicators)
+        high_volume_level = np.percentile(volume_profile, 80)
+        low_volume_level = np.percentile(volume_profile, 20)
+
+        bullish_fvg, bearish_fvg = self.detect_fair_value_gaps(data)
+        order_blocks = self.detect_order_blocks(data)
+
+        if current_price > premium_zone:
+            market_state = 'Premium'
+        elif current_price < discount_zone:
+            market_state = 'Discount'
+        elif abs(ma_diff) < 0.01:
+            if np.max(volume_profile) > high_volume_level:
+                market_state = 'Narrow - High Volume'
+            elif np.max(volume_profile) < low_volume_level:
+                market_state = 'Narrow - Low Volume'
+            else:
+                market_state = 'Narrow'
+        elif ma_diff > 0.01:
+            if ma20 > indicators['ma20'].iloc[-2] and ma200 > indicators['ma200'].iloc[-2]:
+                market_state = 'Trending Up'
+            else:
+                market_state = 'Wide - Bullish'
+        elif ma_diff < -0.01:
+            if ma20 < indicators['ma20'].iloc[-2] and ma200 < indicators['ma200'].iloc[-2]:
+                market_state = 'Trending Down'
+            else:
+                market_state = 'Wide - Bearish'
+        else:
+            market_state = 'Equilibrium'
+
+        levels = {
+            'support': data['low'].tail(20).min(),
+            'resistance': data['high'].tail(20).max(),
+            'current_price': current_price,
+            'equilibrium': equilibrium,
+            'bullish_fvg': bullish_fvg.iloc[-1],
+            'bearish_fvg': bearish_fvg.iloc[-1],
+            'order_block': order_blocks.iloc[-1]
+        }
+
+        return market_state, levels
+    def generate_trading_signals(self, data, indicators):
+        """Signal generation with strict MA20 trend validation"""
+        signals = pd.DataFrame(index=data.index, columns=['signal', 'strategy', 'entry_price', 'market_state'])
+        
+        # Pre-calculate market states for all data points
+        market_state, levels = self.identify_market_state(data, indicators)
+        
+        # Pre-calculate moving averages
+        current_prices = data['close']
+        ma20 = indicators['ma20']
+        
+        last_signal = None
+        signal_cooldown = 0
+        
+        # Use vectorized operations where possible
+        highs = data['high']
+        lows = data['low']
+        
+        for i in range(200, len(data)):
+            if signal_cooldown > 0:
+                signal_cooldown -= 1
+                continue
+                
+            current_price = current_prices.iloc[i]
+            ma20_current = ma20.iloc[i]
+            
+            # Enhanced MA trend validation
+            ma_trend = self.validate_ma_trend(data.iloc[:i+1], ma20.iloc[:i+1])
+            
+            # Only proceed if we have strong trend alignment
+            if not (ma_trend['direction'] != 'neutral' and ma_trend['price_alignment']):
+                continue
+                
+            signal = None
+            strategy = None
+            
+            # Premium Zone Signals
+            if market_state == 'Premium':
+                if (ma_trend['direction'] == 'down' and  # Must be in downtrend
+                    current_price < ma20_current and     # Price below MA20
+                    current_prices.iloc[i-1] < ma20.iloc[i-1]):  # Previous price below MA20
+                    signal = -1
+                    strategy = "Sell in Premium Zone"
+                    
+            # Discount Zone Signals
+            elif market_state == 'Discount':
+                if (ma_trend['direction'] == 'up' and    # Must be in uptrend
+                    current_price > ma20_current and     # Price above MA20
+                    current_prices.iloc[i-1] > ma20.iloc[i-1]):  # Previous price above MA20
+                    signal = 1
+                    strategy = "Buy in Discount Zone"
+                    
+            # Narrow Range Signals
+            elif 'Narrow' in market_state:
+                if (current_price > highs.iloc[i-1] and 
+                    ma_trend['direction'] == 'up' and     # Must be in uptrend
+                    current_price > ma20_current):        # Price above MA20
+                    signal = 1
+                    strategy = "Breakout - Buy"
+                elif (current_price < lows.iloc[i-1] and 
+                      ma_trend['direction'] == 'down' and   # Must be in downtrend
+                      current_price < ma20_current):        # Price below MA20
+                    signal = -1
+                    strategy = "Breakout - Sell"
+                    
+            # Trending Market Signals
+            elif market_state == 'Trending Up':
+                if (ma_trend['direction'] == 'up' and 
+                    current_price > ma20_current and 
+                    current_prices.iloc[i-1] > ma20.iloc[i-1] and
+                    lows.iloc[i] > ma20_current):  # Additional confirmation: low above MA20
+                    signal = 1
+                    strategy = "Buy the Dip"
+                    
+            elif market_state == 'Trending Down':
+                if (ma_trend['direction'] == 'down' and 
+                    current_price < ma20_current and 
+                    current_prices.iloc[i-1] < ma20.iloc[i-1] and
+                    highs.iloc[i] < ma20_current):  # Additional confirmation: high below MA20
+                    signal = -1
+                    strategy = "Sell the Rally"
+                    
+            # Wide Range Market Signals
+            elif 'Wide' in market_state:
+                if 'Bullish' in market_state:
+                    if (ma_trend['direction'] == 'up' and 
+                        current_price > ma20_current and     # Price must be above MA20
+                        lows.iloc[i] > ma20.iloc[i-2]):     # Low must be above previous MA20
+                        signal = 1
+                        strategy = "Buy the Dip in Wide Market"
+                elif 'Bearish' in market_state:
+                    if (ma_trend['direction'] == 'down' and 
+                        current_price < ma20_current and     # Price must be below MA20
+                        highs.iloc[i] < ma20.iloc[i-2]):    # High must be below previous MA20
+                        signal = -1
+                        strategy = "Sell the Rally in Wide Market"
+            
+            # Signal Processing
+            if signal is not None and signal != last_signal:
+                signals.loc[signals.index[i]] = [signal, strategy, current_price, market_state]
+                last_signal = signal
+                signal_cooldown = 5  # Prevent excessive signals
+        
+        return signals.dropna()
+
+    def validate_ma_trend(self, data, ma20):
+        """Validates trend direction using 20 MA"""
+        ma_trend = {
+            'direction': 'neutral',
+            'strength': 0,
+            'price_alignment': False
+        }
+        
+        # Calculate MA slope over last 5 periods
+        ma_slope = (ma20.iloc[-1] - ma20.iloc[-5]) / ma20.iloc[-5]
+        
+        # Determine trend direction
+        if ma_slope > 0.0005:  # Small positive threshold
+            ma_trend['direction'] = 'up'
+            ma_trend['strength'] = min(ma_slope * 1000, 1)  # Normalize strength
+        elif ma_slope < -0.0005:  # Small negative threshold
+            ma_trend['direction'] = 'down'
+            ma_trend['strength'] = min(abs(ma_slope) * 1000, 1)
+            
+        # Check price alignment with MA
+        current_price = data['close'].iloc[-1]
+        prev_price = data['close'].iloc[-2]
+        ma_trend['price_alignment'] = (
+            (ma_trend['direction'] == 'up' and current_price > ma20.iloc[-1] and prev_price > ma20.iloc[-2]) or
+            (ma_trend['direction'] == 'down' and current_price < ma20.iloc[-1] and prev_price < ma20.iloc[-2])
+        )
+        
+        return ma_trend
+
+    def analyze_market(self, data):
+        resampled_data = self.resample_data(data)
+        
+        if len(resampled_data) < 200:
+            return {
+                'resampled_data': resampled_data,
+                'market_state': 'Insufficient Data',
+                'indicators': None,
+                'signals': None,
+                'levels': None
+            }
+
+        indicators = self.calculate_indicators(resampled_data)
+        market_state, levels = self.identify_market_state(resampled_data, indicators)
+        signals = self.generate_trading_signals(resampled_data, indicators)
+
+        return {
+            'resampled_data': resampled_data,
+            'market_state': market_state,
+            'indicators': indicators,
+            'signals': signals,
+            'levels': levels
+        }
+    def analyze_order_flow(self, data, indicators):
+        """Analyzes order flow patterns"""
+        delta = pd.DataFrame(index=data.index)
+        
+        # Calculate buying/selling pressure
+        delta['buying_pressure'] = (data['close'] - data['low']) / (data['high'] - data['low'])
+        delta['selling_pressure'] = 1 - delta['buying_pressure']
+        
+        # Calculate volume delta
+        delta['volume_delta'] = np.where(data['close'] > data['open'], 
+                                       data['volume'], 
+                                       -data['volume'])
+        
+        # Calculate cumulative delta
+        delta['cumulative_delta'] = delta['volume_delta'].cumsum()
+        
+        # Identify absorption levels (high volume with little price movement)
+        price_movement = (data['high'] - data['low']) / data['low']
+        volume_norm = data['volume'] / data['volume'].rolling(20).mean()
+        delta['absorption'] = (volume_norm > 1.5) & (price_movement < 0.002)
+        
+        return delta
+
+    def analyze_vpa(self, data, window=20):
+        """Volume Price Analysis"""
+        vpa = pd.DataFrame(index=data.index)
+        
+        # Calculate relative volume
+        vpa['relative_volume'] = data['volume'] / data['volume'].rolling(window).mean()
+        
+        # Identify high volume bars
+        vpa['high_volume'] = vpa['relative_volume'] > 1.5
+        
+        # Price spread analysis
+        bar_size = (data['high'] - data['low']) / data['low']
+        vpa['wide_range'] = bar_size > bar_size.rolling(window).mean() + bar_size.rolling(window).std()
+        
+        # Volume climax detection
+        vpa['volume_climax'] = (vpa['high_volume'] & 
+                               vpa['wide_range'] & 
+                               (data['close'] == data['high']) | 
+                               (data['close'] == data['low']))
+        
+        # Calculate price rejection
+        upper_wick = data['high'] - data[['open', 'close']].max(axis=1)
+        lower_wick = data[['open', 'close']].min(axis=1) - data['low']
+        body = abs(data['close'] - data['open'])
+        
+        vpa['upper_rejection'] = (upper_wick > body) & vpa['high_volume']
+        vpa['lower_rejection'] = (lower_wick > body) & vpa['high_volume']
+        
+        return vpa
+
+    def analyze_market_structure(self, data, indicators):
+        """Enhanced market structure analysis"""
+        structure = pd.DataFrame(index=data.index)
+        
+        # Identify swing points
+        window = 5
+        structure['swing_high'] = data['high'].rolling(window=window, center=True).max() == data['high']
+        structure['swing_low'] = data['low'].rolling(window=window, center=True).min() == data['low']
+        
+        # Higher highs and lower lows
+        highs = data[structure['swing_high']]['high']
+        lows = data[structure['swing_low']]['low']
+        
+        structure['higher_high'] = False
+        structure['lower_low'] = False
+        
+        for i in range(len(highs)):
+            if i > 0:
+                structure.loc[highs.index[i], 'higher_high'] = highs.iloc[i] > highs.iloc[i-1]
+                
+        for i in range(len(lows)):
+            if i > 0:
+                structure.loc[lows.index[i], 'lower_low'] = lows.iloc[i] < lows.iloc[i-1]
+        
+        # Identify consolidation zones
+        volatility = data['close'].pct_change().rolling(window=20).std()
+        structure['consolidation'] = volatility < volatility.rolling(window=100).mean() * 0.5
+        
+        return structure
+
+    def analyze_volatility(self, data, window=20):
+        """Advanced volatility analysis"""
+        volatility = pd.DataFrame(index=data.index)
+        
+        # Calculate different volatility metrics
+        returns = data['close'].pct_change()
+        volatility['historical'] = returns.rolling(window=window).std() * np.sqrt(252)
+        
+        # Parkinson volatility (uses high-low range)
+        hl_range = np.log(data['high'] / data['low'])
+        volatility['parkinson'] = np.sqrt(1 / (4 * np.log(2)) * hl_range.rolling(window=window).mean() * 252)
+        
+        # Identify volatility regimes
+        vol_percentile = volatility['historical'].rolling(window=100).apply(
+            lambda x: pd.Series(x).rank(pct=True).iloc[-1]
+        )
+        
+        volatility['regime'] = pd.cut(vol_percentile, 
+                                    bins=[0, 0.25, 0.75, 1], 
+                                    labels=['low', 'normal', 'high'])
+        
+        # Volatility breakout detection
+        volatility['breakout'] = volatility['historical'] > volatility['historical'].rolling(window=100).max()
+        
+        return volatility
+
+    def enhance_market_state(self, data, indicators):
+        """Enhanced market state identification incorporating new analyses"""
+        # Get base market state
+        base_state, levels = self.identify_market_state(data, indicators)
+        
+        # Get additional analyses
+        order_flow = self.analyze_order_flow(data, indicators)
+        vpa = self.analyze_vpa(data)
+        structure = self.analyze_market_structure(data, indicators)
+        volatility = self.analyze_volatility(data)
+        
+        # Enhance market state based on additional factors
+        enhanced_state = base_state
+        
+        # Check for absorption
+        if order_flow['absorption'].iloc[-1]:
+            enhanced_state += " - Absorption"
+        
+        # Check for climax
+        if vpa['volume_climax'].iloc[-1]:
+            enhanced_state += " - Climax"
+        
+        # Check structure
+        if structure['consolidation'].iloc[-1]:
+            enhanced_state += " - Consolidating"
+        
+        # Add volatility context
+        enhanced_state += f" ({volatility['regime'].iloc[-1]} volatility)"
+        
+        # Enhanced levels
+        enhanced_levels = levels.copy()
+        enhanced_levels.update({
+            'cumulative_delta': order_flow['cumulative_delta'].iloc[-1],
+            'absorption_level': order_flow['absorption'].iloc[-1],
+            'volume_climax': vpa['volume_climax'].iloc[-1],
+            'volatility_percentile': volatility['historical'].iloc[-1],
+            'in_consolidation': structure['consolidation'].iloc[-1]
+        })
+        
+        return enhanced_state, enhanced_levels
+
+
+# Main analysis function
+def analyze_crude_oil(historical_data, timeframe):
+    analyzer = MarketAnalyzer(timeframe)
+    analysis = analyzer.analyze_market(historical_data)
+
+    print("Market Analysis:")
+    print(f"Current Market State: {analysis['market_state']}")
+    
+    market_state_strategies = {
+        'Premium': f"Sell opportunities, consider bearish spreads. Sell around {analysis['levels']['resistance']:.2f}, stop above {(analysis['levels']['resistance'] * 1.01):.2f}",
+        'Discount': f"Buy opportunities, consider bullish spreads. Buy around {analysis['levels']['support']:.2f}, stop below {(analysis['levels']['support'] * 0.99):.2f}",
+        'Narrow - High Volume': f"Prepare for breakout. Buy above {analysis['levels']['resistance']:.2f}, sell below {analysis['levels']['support']:.2f}. Consider straddles at {analysis['levels']['current_price']:.2f}",
+        'Narrow - Low Volume': f"Wait for clear direction. Consider iron condors with legs at {analysis['levels']['support']:.2f} and {analysis['levels']['resistance']:.2f}",
+        'Trending Up': f"Buy dips, consider bull call spreads. Buy near {analysis['levels']['support']:.2f}, target {(analysis['levels']['resistance'] * 1.05):.2f}",
+        'Trending Down': f"Sell rallies, consider bear put spreads. Sell near {analysis['levels']['resistance']:.2f}, target {(analysis['levels']['support'] * 0.95):.2f}",
+        'Wide - Bullish': f"Buy dips with caution, consider long calls. Buy near {analysis['levels']['support']:.2f} with defined risk",
+        'Wide - Bearish': f"Sell rallies with caution, consider long puts. Sell near {analysis['levels']['resistance']:.2f} with defined risk",
+        'Equilibrium': f"Market in balance. Consider straddles or strangles around {analysis['levels']['equilibrium']:.2f}"
+    }
+    
+    print(f"\nRecommended Strategy: {market_state_strategies.get(analysis['market_state'], 'No specific strategy')}")
+
+    print("\nAdditional Market Information:")
+    print(f"Bullish Fair Value Gap: {'Present' if analysis['levels']['bullish_fvg'] else 'Absent'}")
+    print(f"Bearish Fair Value Gap: {'Present' if analysis['levels']['bearish_fvg'] else 'Absent'}")
+    print(f"Order Block: {'Present' if analysis['levels']['order_block'] else 'Absent'}")
+
+    # Calculate new analysis
+    resampled_data = analysis['resampled_data']
+    order_flow = analyzer.analyze_order_flow(resampled_data, analysis['indicators'])
+    vpa = analyzer.analyze_vpa(resampled_data)
+    structure = analyzer.analyze_market_structure(resampled_data, analysis['indicators'])
+    volatility = analyzer.analyze_volatility(resampled_data)
+
+    # Add enhanced trading levels based on new analysis
+    current_price = analysis['levels']['current_price']
+    
+    print("\nEnhanced Trading Levels:")
+    if order_flow['buying_pressure'].iloc[-1] > 0.7:
+        buy_level = current_price * 1.002
+        stop_level = current_price * 0.998
+        print(f"Strong Buying Pressure - Buy above {buy_level:.2f}, Stop below {stop_level:.2f}")
+    elif order_flow['selling_pressure'].iloc[-1] > 0.7:
+        sell_level = current_price * 0.998
+        stop_level = current_price * 1.002
+        print(f"Strong Selling Pressure - Sell below {sell_level:.2f}, Stop above {stop_level:.2f}")
+
+    if vpa['volume_climax'].iloc[-1]:
+        if vpa['upper_rejection'].iloc[-1]:
+            print(f"Volume Climax with Upper Rejection - Consider shorts below {current_price:.2f}")
+        elif vpa['lower_rejection'].iloc[-1]:
+            print(f"Volume Climax with Lower Rejection - Consider longs above {current_price:.2f}")
+
+    if structure['consolidation'].iloc[-1]:
+        range_high = resampled_data['high'].tail(20).max()
+        range_low = resampled_data['low'].tail(20).min()
+        print(f"Consolidation Range: Buy above {range_high:.2f}, Sell below {range_low:.2f}")
+
+    vol_factor = 1.5 if volatility['regime'].iloc[-1] == 'high' else 1.0
+    atr = analysis['indicators']['atr'].iloc[-1]
+    print(f"Volatility-Adjusted Stops: {(atr * vol_factor):.2f} points")
+
+    # Calculate Initial Target based on market state and ATR
+    if 'Buy' in market_state_strategies.get(analysis['market_state'], ''):
+        target_price = current_price + (atr * 2)
+        print(f"Initial Target: {target_price:.2f} (Long)")
+    elif 'Sell' in market_state_strategies.get(analysis['market_state'], ''):
+        target_price = current_price - (atr * 2)
+        print(f"Initial Target: {target_price:.2f} (Short)")
+    elif 'Narrow' in analysis['market_state']:
+        long_target = current_price + (atr * 1.5)
+        short_target = current_price - (atr * 1.5)
+        print(f"Initial Targets: Long {long_target:.2f} / Short {short_target:.2f}")
+
+    if analysis['signals'] is not None:
+        print("\nRecent Trading Signals:")
+        valid_signals = analysis['signals'].dropna().tail(5)
+        if valid_signals.empty:
+            print("No valid signals generated in the recent period.")
+        else:
+            print(valid_signals[['strategy', 'entry_price', 'market_state']])
+
+        current_state = analysis['market_state']
+        recent_states = valid_signals['market_state'].tolist()
+        if current_state in recent_states:
+            conf_level = "High" if order_flow['absorption'].iloc[-1] else "Medium"
+            print(f"\nHigh Probability Setup: Current market state ({current_state}) aligns with recent trading signals.")
+            print(f"Confidence Level: {conf_level} (Based on Order Flow)")
+        else:
+            print("\nCaution: Current market state doesn't align with recent trading signals. Consider waiting for confirmation.")
+    else:
+        print("\nInsufficient data to generate trading signals.")
+
+    return analysis
+
+
+# Example usage
+if __name__ == "__main__":
+    historical_data = pd.read_csv(r"/Users/rikkawal/Downloads/edata.csv")
+    timeframe = input("Enter timeframe (e.g., '1H' for 1 hour, '15T' for 15 minutes): ")
+    analysis = analyze_crude_oil(historical_data, timeframe)
